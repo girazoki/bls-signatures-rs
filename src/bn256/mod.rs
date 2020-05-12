@@ -48,6 +48,8 @@ impl Bn256 {
     fn arbitrary_string_to_g1(&self, data: &[u8]) -> Result<G1, Error> {
         let mut v = vec![0x02];
         v.extend(data);
+        println!("intofun{:x?}", v);
+
         let point = G1::from_compressed(&v)?;
 
         Ok(point)
@@ -69,15 +71,32 @@ impl Bn256 {
         let mut c = 0..255;
 
         // Add counter suffix
+        // This message should be: ciphersuite || 0x01 || message || ctr
+        // For the moment we work with message || ctr until a tag is decided
         let mut v = [&message[..], &[0x00]].concat();
         let position = v.len() - 1;
 
-        // `Hash(cipher||PK||data)`
+        // `Hash(data||ctr)`
+        // The modulus of bn256 is low enough to trigger several iterations of this loop
+        // We instead compute attempted_hash = `Hash(data||ctr)` mod Fq::modulus
+        // This should trigger less iterations of the loop
         let point = c.find_map(|ctr| {
             v[position] = ctr;
-            let attempted_hash = self.calculate_sha256(&v);
-            // Check validity of `H` (i.e. point exists in group G1)
-            self.arbitrary_string_to_g1(&attempted_hash).ok()
+            let hash = &self.calculate_sha256(&v)[0..32];
+            // this should never fail as the length of sha256 is max 256
+            let mut attempted_hash = arith::U256::from_slice(hash).unwrap();
+
+            // the library does not provide a function to do a modulus
+            // we use the provided add function adding a 0
+            // we also need to iterate here as the library does the modulus only once
+            while attempted_hash > Fq::modulus() {
+                attempted_hash.add(&arith::U256::zero(), &Fq::modulus());
+            }
+            let mut s = [0u8; 32];
+            match attempted_hash.to_big_endian(&mut s) {
+                Ok(_) => self.arbitrary_string_to_g1(&s).ok(),
+                _ => None,
+            }
         });
 
         // Return error if no valid point was found
@@ -141,10 +160,8 @@ pub struct PrivateKey(bn::Fr);
 pub struct PublicKey(bn::G2);
 
 impl PrivateKey {
-
     /// Function to derive a private key.
     pub fn new(rng: &[u8]) -> Result<PrivateKey, Error> {
-
         // This function throws an error if the slice does not have a proper length.
         let private_key = Fr::from_slice(&rng)?;
 
@@ -155,11 +172,11 @@ impl PrivateKey {
     pub fn to_bytes(self) -> Result<Vec<u8>, Error> {
         let mut result: [u8; 32] = [0; 32];
         // to_big_endian from bn::Fr does not work here.
-        self.0.into_u256().to_big_endian(&mut result);
+        self.0.into_u256().to_big_endian(&mut result)?;
 
         Ok(result.to_vec())
     }
-    
+
     /// Function to derive the bn256 public key from the private key.
     pub fn derive_public_key(self) -> Result<PublicKey, Error> {
         let PrivateKey(sk) = self;
@@ -389,11 +406,12 @@ mod test {
 
     #[test]
     fn test_valid_private_key() {
-        let compressed= hex::decode("023aed31b5a9e486366ea9988b05dba469c6206e58361d9c065bbea7d928204a").unwrap();
+        let compressed =
+            hex::decode("023aed31b5a9e486366ea9988b05dba469c6206e58361d9c065bbea7d928204a")
+                .unwrap();
         let private_key = PrivateKey::new(&compressed.as_slice());
         assert_eq!(private_key.is_err(), false);
         assert_eq!(private_key.unwrap().to_bytes().unwrap(), compressed);
-
     }
 
     #[test]
@@ -518,7 +536,19 @@ mod test {
         let hash_point = Bn256.hash_to_try_and_increment(&data).unwrap();
         let hash_bytes = Bn256.to_compressed_g1(hash_point).unwrap();
 
-        let expected_hash = "022f314aad50eb30c15d7e61c0f99874a6aa0d773a5a9f4262b1cda997e3c8da07";
+        let expected_hash = "0211e028f08c500889891cc294fe758a60e84495ec1e2d0bce208c9fc67b6486fd";
+        assert_eq!(hex::encode(hash_bytes), expected_hash);
+    }
+
+    /// Test for the `hash_to_try_and_increment` function with own test vector
+    #[test]
+    fn test_hash_to_try_and_increment_2() {
+        // Data to be hashed with TAI (ASCII "hello")
+        let data = hex::decode("68656c6c6f").unwrap();
+        let hash_point = Bn256.hash_to_try_and_increment(&data).unwrap();
+        let hash_bytes = Bn256.to_compressed_g1(hash_point).unwrap();
+
+        let expected_hash = "0201b97624306270bf9c7f9451b541ecc96600b9cfc85580866e6a702df466a6d9";
         assert_eq!(hex::encode(hash_bytes), expected_hash);
     }
 
@@ -535,7 +565,7 @@ mod test {
         let signature = Bn256.sign(&secret_key, &data).unwrap();
 
         let expected_signature =
-            "031a2752fd966c0f24ccaa684aa0c303f430e56cf9e0917d8d2841b2a83488cbba";
+            "020f047a153e94b5f109e4013d1bd078112817cf0d58cdf6ba8891f9849852ba5b";
 
         assert_eq!(hex::encode(signature), expected_signature);
     }
@@ -551,7 +581,7 @@ mod test {
 
         // Signature
         let signature =
-            hex::decode("031a2752fd966c0f24ccaa684aa0c303f430e56cf9e0917d8d2841b2a83488cbba")
+            hex::decode("020f047a153e94b5f109e4013d1bd078112817cf0d58cdf6ba8891f9849852ba5b")
                 .unwrap();
 
         // Message signed
